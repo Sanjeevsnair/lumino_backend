@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup
+# BeautifulSoup replaced by Playwright for more robust scraping
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -130,6 +130,47 @@ def _httpx_get(url: str, timeout: int = 25, headers: dict = None):
             return client.get(url)
     except Exception: return None
 
+def _playwright_get(url: str, timeout: int = 30, headers: dict = None):
+    """
+    Final fallback: Use a real headless browser (Playwright).
+    This is slow but very effective against Cloudflare.
+    Requires: playwright install --with-deps chromium
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            # We use chromium as it is the most standard for bypasses
+            browser = p.chromium.launch(headless=True)
+            # Use the same User-Agent as our other strategies
+            context = browser.new_context(
+                user_agent=_BASE_HEADERS["User-Agent"],
+                viewport={'width': 1280, 'height': 720}
+            )
+            page = context.new_page()
+            
+            # Set headers if provided
+            if headers:
+                page.set_extra_http_headers(headers)
+            
+            # Navigate and wait for the page to be ready
+            response = page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            
+            # Optional: handle short Cloudflare delays
+            if "Cloudflare" in page.title() or "Just a moment" in page.content():
+                page.wait_for_timeout(5000)
+                
+            content = page.content()
+            status = response.status if response else 500
+            browser.close()
+            
+            class _FakeResp:
+                status_code = status
+                text = content
+            return _FakeResp()
+    except Exception as e:
+        logger.debug(f"[http:playwright] {url!r} → {e}")
+        return None
+
 def fetch_text(url: str, timeout: int = 25, headers: dict = None) -> Optional[str]:
     strategies = [
         ("relay", _relay_get if RELAY_URL else None),
@@ -137,6 +178,7 @@ def fetch_text(url: str, timeout: int = 25, headers: dict = None) -> Optional[st
         ("cffi", _cffi_get),
         ("cloudscraper", _cloud_get),
         ("httpx", _httpx_get),
+        ("playwright", _playwright_get),
         ("requests", _requests_get),
     ]
     for name, fn in strategies:
