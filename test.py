@@ -30,7 +30,7 @@ import uvicorn
 # =====================================================================
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("lumino")
@@ -411,15 +411,35 @@ def _extract_storage(html: str, storage_name: str) -> Dict:
     """
     Parse window['movie_storage'] = { ... } or window['show_storage'] = { ... }
     from play-page HTML. Returns scalar dict of parsed key-value pairs.
+    Uses a bracket-counter approach to correctly handle nested objects.
     """
-    pat = (
-        rf"window\['{re.escape(storage_name)}'\]\s*=\s*"
-        r"\{([^{}]+(?:\{[^{}]*\}[^{}]*)*)\}"
+    # Find the start of the assignment
+    pat_start = re.compile(
+        rf"window\['{re.escape(storage_name)}'\]\s*=\s*\{{",
+        re.S
     )
-    m = re.search(pat, html, re.S)
+    m = pat_start.search(html)
     if not m:
+        logger.debug(f"[_extract_storage] '{storage_name}' not found in HTML")
         return {}
-    block = m.group(1)
+
+    # Walk forward counting braces to find the matching closing brace
+    start = m.end() - 1  # position of the opening '{'
+    depth = 0
+    end = start
+    for i in range(start, len(html)):
+        if html[i] == '{':
+            depth += 1
+        elif html[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    else:
+        logger.debug(f"[_extract_storage] unmatched braces for '{storage_name}'")
+        return {}
+
+    block = html[start + 1:end]   # content between the outer { }
     result: Dict = {}
     for km in re.finditer(
         r"(\w+)\s*:\s*(?:'([^']*)'|\"([^\"]*)\"|([-\d]+))", block
@@ -429,22 +449,37 @@ def _extract_storage(html: str, storage_name: str) -> Dict:
         if val is None and km.group(4) is not None:
             val = int(km.group(4))
         result[key] = val
+    logger.debug(f"[_extract_storage] '{storage_name}' keys: {list(result.keys())}")
     return result
 
 
 def _parse_subtitles(raw_list: list) -> Dict[str, List[str]]:
     """
-    Convert API subtitle list [{"language": "English", "file": "/path"}]
-    into grouped dict {"English": ["https://..."], ...}.
+    Convert API subtitle list into grouped dict {"English": ["https://..."], ...}.
+
+    Handles two API formats from LookMovie2:
+      - Movies:  {"language": "English", "file": "/storage6/subs/..."}
+      - Shows:   {"language": "English", "file": [id, id, "lang", "title", "/storage6/.vtt", ...]}
+                 The list mixes integers, language codes, titles, and actual VTT paths.
     """
     grouped: Dict[str, List[str]] = {}
     for entry in raw_list or []:
         lang = entry.get("language", "Unknown")
-        path = entry.get("file", "")
-        if not path:
+        raw_file = entry.get("file", "")
+        if not raw_file:
             continue
-        url = path if path.startswith("http") else BASE_URL + path
-        grouped.setdefault(lang, []).append(url)
+        # Normalise to list (shows send a mixed list, movies send a plain string)
+        paths = raw_file if isinstance(raw_file, list) else [raw_file]
+        for path in paths:
+            if not path or not isinstance(path, str):
+                continue   # skip numeric IDs and None
+            # Only keep actual subtitle file paths (VTT/SRT/ASS) or full URLs
+            if path.startswith("http"):
+                grouped.setdefault(lang, []).append(path)
+            elif path.startswith("/") and "." in path.split("/")[-1]:
+                # e.g. /storage8/.../en_abc.vtt  - has a file extension
+                grouped.setdefault(lang, []).append(BASE_URL + path)
+            # skip language codes, titles, numeric IDs etc.
     return grouped
 
 
@@ -480,8 +515,22 @@ def lm_get_streams(
         storage = _extract_storage(html, "show_storage")
         hash_val = storage.get("hash")
         expires  = storage.get("expires")
-        if not all([hash_val, expires, episode_id]):
-            logger.warning(f"[lm_get_streams] incomplete show_storage or missing episode_id: {storage}")
+        logger.info(
+            f"[lm_get_streams] show_storage → hash={hash_val!r} "
+            f"expires={expires!r} episode_id={episode_id!r}"
+        )
+        if not episode_id:
+            logger.warning("[lm_get_streams] episode_id is missing — cannot call episode-access API")
+            return _empty
+        if not hash_val or not expires:
+            # Scan the HTML for all window['...'] = { patterns to debug the actual variable name
+            all_window_vars = re.findall(r"window\['([^']+)'\]\s*=", html)
+            logger.warning(
+                f"[lm_get_streams] show_storage missing hash/expires. "
+                f"All window[...] vars found in HTML: {all_window_vars}\n"
+                f"Full storage dict: {storage}\n"
+                f"HTML snippet (first 3000 chars):\n{html[:3000]}"
+            )
             return _empty
         api_url = (
             f"{BASE_URL}/api/v1/security/episode-access"
@@ -892,15 +941,26 @@ def _resolve_single(play_data: str) -> List[Dict]:
     """
     Worker: decode play_data, call lm_get_streams, return list of stream dicts.
     """
-    item_type, play_url, episode_id = _decode_play_data(play_data)
+    try:
+        item_type, play_url, episode_id = _decode_play_data(play_data)
+    except Exception as e:
+        logger.error(f"[extract] _decode_play_data failed for {play_data[:80]!r}: {e}", exc_info=True)
+        return []
+
     logger.info(
         f"[extract] resolving type={item_type!r} "
         f"play_url={play_url[:80]!r} episode_id={episode_id!r}"
     )
 
-    result = lm_get_streams(play_url, item_type, episode_id)
+    try:
+        result = lm_get_streams(play_url, item_type, episode_id)
+    except Exception as e:
+        logger.error(f"[extract] lm_get_streams failed: {e}", exc_info=True)
+        return []
+
     streams   = result.get("streams",   {})
     subtitles = result.get("subtitles", {})
+    logger.info(f"[extract] got {len(streams)} stream(s) for {play_url[:80]!r}")
 
     # Quality ordering (best first)
     order = ["1080p", "1080", "720p", "720", "480p", "480", "360p", "360"]
@@ -963,7 +1023,10 @@ async def api_extract(req: ExtractRequest):
                 streams = fut.result()
                 all_results.extend(streams)
             except Exception as e:
-                logger.warning(f"[api_extract] worker failed for {play_data[:60]!r}: {e}")
+                logger.error(
+                    f"[api_extract] worker failed for {play_data[:60]!r}: {e}",
+                    exc_info=True
+                )
 
     if not all_results:
         logger.warning("[api_extract] no streams resolved")
