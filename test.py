@@ -264,9 +264,19 @@ def _extract_storage(html: str, storage_name: str) -> Dict:
         block = html[start + 1:end]
     else: block = m.group(1)
     res = {}
-    for km in re.finditer(r"(\w+)\s*:\s*(?:'([^']*)'|\"([^\"]*)\"|([-\d]+))", block):
-        k, v = km.group(1), km.group(2) or km.group(3)
-        if v is None and km.group(4): v = int(km.group(4))
+    # Match: key: 'val', key: "val", key: 123, key: true
+    for km in re.finditer(r"(\w+)\s*:\s*(?:'([^']*)'|\"([^\"]*)\"|([-\d]+)|(true|false|null))", block):
+        k = km.group(1)
+        v = km.group(2) or km.group(3)
+        if v is None:
+            if km.group(4):
+                try: v = int(km.group(4))
+                except: v = km.group(4)
+            elif km.group(5):
+                gv = km.group(5)
+                if gv == "true": v = True
+                elif gv == "false": v = False
+                else: v = None
         res[k] = v
     return res
 
@@ -305,7 +315,9 @@ def lm_get_streams(play_url: str, item_type: str, ep_id: str = None) -> Dict:
         api_url = f"{BASE_URL}/api/v1/security/episode-access?id_episode={ep_id}&hash={h}&expires={exp}"
 
     data = fetch_json(api_url, headers=api_headers)
-    if not data or not data.get("success"): return _empty
+    if not data or not data.get("success"):
+        logger.warning(f"[lm_get_streams] security API failed or success=False: {data} (URL: {api_url})")
+        return _empty
     
     streams = {k: (v if v.startswith("http") else BASE_URL + v) for k, v in data.get("streams", {}).items() if v}
     return {"streams": streams, "subtitles": _parse_subtitles(data.get("subtitles", []))}
@@ -343,7 +355,7 @@ def _decode_play_data(pd: str) -> Tuple[str, str, Optional[str]]:
 class SearchRequest(BaseModel): query: str
 class LinksRequest(BaseModel): url: str; season: Optional[int] = None; episode: Optional[int] = None; id: Optional[int] = None
 class ExtractRequest(BaseModel): hubdrive_links: List[str]
-class StreamResult(BaseModel): server: str; url: str; quality: int = 0; label: str = ""; type: str = "m3u8"; subtitles: Dict = {}
+class StreamResult(BaseModel): server: str; url: str; quality: int = 0; label: str = ""; type: str = "m3u8"; subtitles: Dict = {}; user_agent: Optional[str] = None
 class ExtractedResponse(BaseModel): status: str; total_links: int; results: List[StreamResult]
 
 # =====================================================================
@@ -389,25 +401,12 @@ def _resolve_single(pd: str) -> List[Dict]:
     try:
         t, url, ep_id = _decode_play_data(pd)
         res = lm_get_streams(url, t, ep_id)
-        # Prioritize 'auto' or 'master' playlists as they usually work best
-        order = ["auto", "master", "1080p", "1080", "720p", "720", "480p", "480"]
-        
-        results = []
-        for k, v in res["streams"].items():
-            results.append({
-                "server": "LookMovie2",
-                "url": v,
-                "quality": _parse_quality_to_int(k),
-                "label": "Auto" if k in ["auto", "master"] else (f"{k}p" if str(k).isdigit() else k),
-                "type": "m3u8",
-                "subtitles": res["subtitles"]
-            })
-            
-        # Sort results based on the defined order
-        results.sort(key=lambda x: order.index(x["label"].replace("p", "").lower()) if x["label"].replace("p", "").lower() in order else (order.index("auto") if x["label"] == "Auto" else 99))
-        
-        logger.debug(f"[_resolve_single] Resolved {len(results)} streams for {url!r}")
-        return results
+        order = ["1080p", "1080", "720p", "720", "480p", "480"]
+        return [{
+            "server": "LookMovie2", "url": v, "quality": _parse_quality_to_int(k),
+            "label": f"{k}p" if str(k).isdigit() else k, "type": "m3u8", "subtitles": res["subtitles"],
+            "user_agent": _BASE_HEADERS["User-Agent"]
+        } for k, v in sorted(res["streams"].items(), key=lambda x: order.index(str(x[0])) if str(x[0]) in order else 99)]
     except Exception: return []
 
 @app.post("/api/extract", response_model=ExtractedResponse)
