@@ -389,11 +389,25 @@ def _resolve_single(pd: str) -> List[Dict]:
     try:
         t, url, ep_id = _decode_play_data(pd)
         res = lm_get_streams(url, t, ep_id)
-        order = ["1080p", "1080", "720p", "720", "480p", "480"]
-        return [{
-            "server": "LookMovie2", "url": v, "quality": _parse_quality_to_int(k),
-            "label": f"{k}p" if str(k).isdigit() else k, "type": "m3u8", "subtitles": res["subtitles"]
-        } for k, v in sorted(res["streams"].items(), key=lambda x: order.index(str(x[0])) if str(x[0]) in order else 99)]
+        # Prioritize 'auto' or 'master' playlists as they usually work best
+        order = ["auto", "master", "1080p", "1080", "720p", "720", "480p", "480"]
+        
+        results = []
+        for k, v in res["streams"].items():
+            results.append({
+                "server": "LookMovie2",
+                "url": v,
+                "quality": _parse_quality_to_int(k),
+                "label": "Auto" if k in ["auto", "master"] else (f"{k}p" if str(k).isdigit() else k),
+                "type": "m3u8",
+                "subtitles": res["subtitles"]
+            })
+            
+        # Sort results based on the defined order
+        results.sort(key=lambda x: order.index(x["label"].replace("p", "").lower()) if x["label"].replace("p", "").lower() in order else (order.index("auto") if x["label"] == "Auto" else 99))
+        
+        logger.debug(f"[_resolve_single] Resolved {len(results)} streams for {url!r}")
+        return results
     except Exception: return []
 
 @app.post("/api/extract", response_model=ExtractedResponse)
