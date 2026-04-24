@@ -57,6 +57,21 @@ BASE_URL = "https://www.lookmovie2.to"
 
 FLARE_URL  = os.environ.get("FLARESOLVERR_URL", "").rstrip("/")
 HTTP_PROXY = os.environ.get("HTTP_PROXY", "") or os.environ.get("HTTPS_PROXY", "")
+RELAY_URL  = os.environ.get("RELAY_URL", "").rstrip("/")
+# RELAY_URL: any URL that accepts GET /?url=<encoded_target_url> and returns its body.
+# Free option — deploy this 5-line Cloudflare Worker (free tier, 100k req/day):
+#
+#   export default {
+#     async fetch(request) {
+#       const target = new URL(request.url).searchParams.get('url');
+#       if (!target) return new Response('missing ?url=', {status: 400});
+#       const resp = await fetch(target, { headers: { 'User-Agent': request.headers.get('User-Agent') || 'Mozilla/5.0' }});
+#       return new Response(await resp.text(), { status: resp.status, headers: { 'Content-Type': resp.headers.get('Content-Type') || 'text/plain' }});
+#     }
+#   };
+#
+# Deploy at: https://dash.cloudflare.com/ → Workers → Create Worker → paste above → Deploy
+# Then set RELAY_URL = https://your-worker.your-subdomain.workers.dev  in HF Spaces Variables
 
 _PROXIES = {"http": HTTP_PROXY, "https": HTTP_PROXY} if HTTP_PROXY else {}
 
@@ -80,6 +95,32 @@ _BASE_HEADERS = {
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
 }
+
+
+def _relay_get(url: str, timeout: int = 25, headers: dict = None):
+    """
+    Fetch url via a relay/proxy worker (e.g. a Cloudflare Worker).
+    The relay must accept: GET {RELAY_URL}/?url=<encoded_url>
+    and return the response body directly.
+    Activated when RELAY_URL env var is set.
+    """
+    if not RELAY_URL:
+        return None
+    try:
+        import httpx
+        relay_request_url = f"{RELAY_URL}/?url={urllib.parse.quote(url, safe='')}"
+        h = {
+            **_BASE_HEADERS,
+            **(headers or {}),
+            # strip headers the relay shouldn't forward
+        }
+        with httpx.Client(timeout=timeout, follow_redirects=True, verify=False) as client:
+            resp = client.get(relay_request_url, headers=h)
+            logger.debug(f"[http:relay] {url!r} via relay → HTTP {resp.status_code}")
+            return resp
+    except Exception as e:
+        logger.debug(f"[http:relay] {url!r} failed: {e}")
+    return None
 
 
 def _flaresolverr_get(url: str, timeout: int = 60, headers: dict = None):
@@ -222,10 +263,11 @@ def _httpx_get(url: str, timeout: int = 25, headers: dict = None):
 
 def fetch_text(url: str, timeout: int = 25, headers: dict = None) -> Optional[str]:
     """Fetch using best available strategy.
-    Chain: FlareSolverr → curl_cffi → requests → cloudscraper → httpx
+    Chain: relay → FlareSolverr → curl_cffi → requests → cloudscraper → httpx
     """
     strategies = [
-        ("flaresolverr", _flaresolverr_get if FLARE_URL else None),
+        ("relay",        _relay_get        if RELAY_URL  else None),
+        ("flaresolverr", _flaresolverr_get if FLARE_URL  else None),
         ("cffi",         _cffi_get),
         ("requests",     _requests_get),
         ("cloudscraper", _cloud_get),
@@ -244,7 +286,7 @@ def fetch_text(url: str, timeout: int = 25, headers: dict = None) -> Optional[st
         except Exception as e:
             logger.debug(f"[fetch_text] {name} exception for {url!r}: {e}")
         if name == "cffi":
-            time.sleep(0.3)   # brief backoff before next strategy
+            time.sleep(0.3)
     logger.warning(f"[fetch_text] ALL strategies failed for {url!r}")
     return None
 
@@ -582,6 +624,7 @@ class ExtractedResponse(BaseModel):
 async def lifespan(app: FastAPI):
     logger.info("=== Lumino LookMovie2 API starting ===")
     logger.info(f"Provider base URL : {BASE_URL}")
+    logger.info(f"Relay URL         : {RELAY_URL or '(not set)'}")
     logger.info(f"FlareSolverr      : {FLARE_URL or '(not set)'}")
     logger.info(f"HTTP Proxy        : {HTTP_PROXY or '(not set)'}")
     yield
@@ -619,6 +662,7 @@ async def health():
         "status":         "healthy",
         "provider":       "lookmovie2",
         "base_url":       BASE_URL,
+        "relay":          RELAY_URL or None,
         "flaresolverr":   FLARE_URL or None,
         "proxy":          bool(HTTP_PROXY),
     }
@@ -643,7 +687,8 @@ async def api_debug(q: str = "avengers"):
     }
 
     strategies = [
-        ("flaresolverr", _flaresolverr_get if FLARE_URL else None),
+        ("relay",        _relay_get        if RELAY_URL  else None),
+        ("flaresolverr", _flaresolverr_get if FLARE_URL  else None),
         ("cffi",         _cffi_get),
         ("requests",     _requests_get),
         ("cloudscraper", _cloud_get),
@@ -667,6 +712,7 @@ async def api_debug(q: str = "avengers"):
 
     return {
         "url":              url,
+        "relay":            RELAY_URL or None,
         "flaresolverr":     FLARE_URL or None,
         "proxy":            HTTP_PROXY or None,
         "strategy_results": results,
