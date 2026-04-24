@@ -1,0 +1,9 @@
+# LookMovie2 scraper dependencies
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+curl_cffi>=0.15.0
+cloudscraper>=1.2.71
+beautifulsoup4>=4.14.0
+httpx[http2]>=0.24.0
+requests>=2.31.0
+pydantic>=2.0.0
